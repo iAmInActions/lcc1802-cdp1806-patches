@@ -128,6 +128,7 @@ _modI2:	;16 bit signed remainder
     Cretn
  ENDIF
 _out4:
+	ld2	regArg1,'D',ARGBUF+0,0 ;fetch char arg from fixed RAM argument area
 	glo	regArg1
 	dec	sp
 	str	sp
@@ -422,6 +423,9 @@ $$shift:
     cretn	;and we're done. if Rp1p2 is not 0 or -1 we've overflowed
 
 	align 256
+	if $ = 07F00h
+	    org $+0100h	;0x7F00 is reserved for the syscall vector table BIOS_GPU.c's syscall() builds with "ORG 0x7F00", dont let a page aligned routine land on top of it
+	endif
 ;signed integer division RL8=RL8/RL10, remainder in Rp1p2
 ;uses unsigned division of absolute values then negates the quotient if the signs were originally different
 _divI4:

@@ -119,6 +119,21 @@ saving reg:  CVUI2(INDIRU1(addr))     "\tld1 R%c,%0\n\tzExt R%c ;CVUI2(INDIRU1(a
 #define REG_RETADDR     6      /* R6: return address */
 #define REG_MEMADDR	14	/* used by macros */
 #define NUM_ARG_REGS    (REG_LAST_ARG - REG_FIRST_ARG + 1)
+	/* REG_FIRST_ARG/REG_LAST_ARG/rp1p2 remain in use as the fixed operand
+	   registers for compiler-emitted runtime helper calls (_divi2, _mulu2,
+	   long return values, etc.); that is a *different*, internal calling
+	   convention and is intentionally left untouched below.  User-level C
+	   function arguments no longer use hardware registers at all; they are
+	   always passed through the fixed-address buffer ARGBUF (see argreg(),
+	   emit2()'s ARG+x case, and function() below). */
+#define ARGBUF_SIZE     16	/* bytes available in the fixed RAM argument area; this is
+				   a hard ceiling checked by argreg()/function() below, not a
+				   fixed cost: regular (non-vararg) parameter copying is always
+				   sized to the real parameter list.  The one place this bound
+				   directly drives code size is a va_alist function's vararg
+				   tail copy, which conservatively copies everything ARGBUF
+				   could still hold past the named parameters; keep this at
+				   the smallest value that covers every call in the program. */
 
 #define INT_CALLEE_SAVE INTVAR  //wjr jan 8 return address is saved in the call - save only the intvars
 
@@ -177,6 +192,17 @@ static char* wjrenv=0;		//controls whether an environment include precedes the p
 static int wjrfloats=0;		//indicates whether floats have been used or not
 static int wjrMulInlineWeight=5; //weight of 5 allows multiplies to be done inline
 static int reg_sp_actual=REG_SP;		//stack pointer is reg 2 by default
+static int argbufloc=0xEF00;	/* default base address of the fixed RAM argument-passing area,
+				   override with -argbufloc=N. MUST be genuine writable RAM, not
+				   ROM: 0x7F00 (this backend's original default) turned out to sit
+				   inside the SBC1806's bank-switched ROM window (0x0000-0x7FFF).
+				   BIOS_GPU.c's syscall() burns its syscall vector table there via
+				   "ORG 0x7F00" at *compile* time, so writes to it at runtime would
+				   be writes to ROM. 0xEF00 sits just above STACKLOC=0xEEEE, in the
+				   region BIOS_GPU.c's own comments describe as reserved for BIOS
+				   use ("stack went from 0xFFFF to EEEE to allow BIOS (reserved
+				   memory) bytes"); verify this against your own memory map
+				   before relying on it. */
 static int cseg;
 
 %}
@@ -715,6 +741,10 @@ static void progbeg(int argc, char *argv[]) {
                         wjrenv = strstr(argv[i], "-env=")+5;//point to the environment variable
                 	fprintf(stderr,"environment specified %s\n",wjrenv);
                 }
+                if (strstr(argv[i], "-argbufloc=") != 0){ //accept combined args
+                        argbufloc = atoi(strstr(argv[i], "-argbufloc=")+11);
+                	fprintf(stderr,"argument buffer relocated to 0x%x\n",argbufloc);
+                }
 	}
 	fprintf(stderr,"September, I'll remember the fourth wave\n");  //just so I know who's playing
         time(&now);
@@ -723,6 +753,8 @@ static void progbeg(int argc, char *argv[]) {
         printf("SP:\tequ	%d ;stack pointer\n" "memAddr: equ	%d\n" "retAddr: equ	%d\n" //pass on reg definitions to assembler
         	"retVal:\tequ\t%d\n" "regArg1: equ	%d\n" "regArg2: equ	%d\n",
         	reg_sp_actual,REG_MEMADDR,REG_RETADDR,REG_RETVAL,REG_FIRST_ARG,REG_FIRST_ARG+1);
+        printf("ARGBUF:\tequ\t%d ;fixed RAM area for C function arguments, %d bytes\n",
+        	argbufloc,ARGBUF_SIZE);
 	if (wjrcpu1805){ //compiling for 1804/1805/1806
 		print("\tcpu\t1805a\n");
 	}
@@ -791,9 +823,62 @@ static Symbol rmap(int opk) {
                 return 0;
         }
 }
+/* Tracks, per va_alist function actually called from this translation unit,
+   the largest total argument byte count (named + variadic) that any call
+   site here has been seen to pass it; gen.c's docall() already computes
+   this exact total for every CALL node (in p->syms[0], read via
+   varargcallbytes() below) before target()/emit2() ever see the node, so
+   this just remembers the running maximum per callee.
+
+   function() uses this (see varargmaxfor()) to size a va_alist function's
+   vararg tail-copy to what this file actually needs instead of the full
+   ARGBUF_SIZE ceiling. This is only sound if every call to a given va_alist
+   function is compiled; i.e. textually appears; before that function's
+   own definition, so the maximum is complete by the time function() reads
+   it; if no call was seen yet function() falls back to the safe ARGBUF_SIZE
+   bound. Putting va_alist function definitions after all their call sites
+   in the same file (as this project's printf()/stdlib.c already does)
+   keeps this exact. */
+#define MAX_VARARG_TRACK 8
+static Symbol vatrack_sym[MAX_VARARG_TRACK];
+static int    vatrack_max[MAX_VARARG_TRACK];
+static int    vatrack_n = 0;
+
+static int varargcallbytes(Node p) {
+        return p->syms[0]->u.c.v.i;	/* set by gen.c's docall() before target()/emit2() run */
+}
+static void varargtrack(Node p) {
+        Symbol f;
+        int bytes, i;
+        if (generic(p->op) != CALL || p->kids[0] == NULL || p->kids[0]->syms[0] == NULL)
+                return;
+        f = p->kids[0]->syms[0];	/* callee for a direct call, from its ADDRGP2 */
+        if (!isfunc(f->type) || !variadic(f->type))
+                return;
+        bytes = varargcallbytes(p);
+        for (i = 0; i < vatrack_n; i++)
+                if (vatrack_sym[i] == f) {
+                        if (bytes > vatrack_max[i])
+                                vatrack_max[i] = bytes;
+                        return;
+                }
+        if (vatrack_n < MAX_VARARG_TRACK) {
+                vatrack_sym[vatrack_n] = f;
+                vatrack_max[vatrack_n] = bytes;
+                vatrack_n++;
+        }
+}
+static int varargmaxfor(Symbol f) {
+        int i;
+        for (i = 0; i < vatrack_n; i++)
+                if (vatrack_sym[i] == f)
+                        return vatrack_max[i];
+        return ARGBUF_SIZE;	/* no call seen (yet) in this file; safe fallback */
+}
 static void target(Node p) {
 	int sz = opsize(p->op);
         assert(p);
+        varargtrack(p);
         switch (specific(p->op)) {
         case CALL+V:
                 break;
@@ -822,19 +907,13 @@ static void target(Node p) {
 
 		}
                 break;
-        case ARG+F: case ARG+I: case ARG+P: case ARG+U: {
-                static int ty0;
-                int ty = optype(p->op);
-                Symbol q;
-
-                q = argreg(p->x.argno, p->syms[2]->u.c.v.i, ty, opsize(p->op), ty0);
-                if (p->x.argno == 0)
-                        ty0 = ty;
-                if (q /*&& 					//wjr
-                !(ty == F && q->x.regnode->set == IREG)*/)
-                        rtarget(p, 0, q);
+        case ARG+F: case ARG+I: case ARG+P: case ARG+U:
+                /* Arguments are always stored to the fixed ARGBUF area (see
+                   emit2()'s ARG+x case and function() below), never targeted
+                   to a hardware register, so there is nothing to do here
+                   beyond the bounds check that argreg() performs. */
+                argreg(p->x.argno, p->syms[2]->u.c.v.i, optype(p->op), opsize(p->op), 0);
                 break;
-                }
          case CVI+F:	//wjr targetting conversion to float
         	//fprintf(stderr,"target selection for CV+I\n");
 		setreg(p,lreg[REG_FIRST_TEMP]);
@@ -913,8 +992,6 @@ static void emitmulcon(int c){ //going to multiply the value in R13 by the const
 static void emit2(Node p) {
         int dst, n, src, sz, ty;
         int szkids0;
-        static int ty0;
-        Symbol q;
     	int op = specific(p->op); 
         switch (specific(p->op)) {
         //default: dumptree(p); fputc('\n',stderr); break; /* debugging only*/
@@ -931,18 +1008,19 @@ static void emit2(Node p) {
                 }
                 break;
         case ARG+F: case ARG+I: case ARG+P: case ARG+U:
-                ty = optype(p->op);
+                /* Outgoing arguments always go to the fixed RAM argument area
+                   (ARGBUF), never to a hardware register; this is what lets
+                   any number/mix of arguments be passed, and lets hand-written
+                   or linked assembly read them back by a fixed symbolic
+                   address instead of having to guess which register the
+                   compiler chose. */
                 sz = opsize(p->op);
-                if (p->x.argno == 0)
-                        ty0 = ty;
-                q = argreg(p->x.argno, p->syms[2]->u.c.v.i, ty, sz, ty0);
+                argreg(p->x.argno, p->syms[2]->u.c.v.i, optype(p->op), sz, 0); /* bounds check only */
                 src = getregnum(p->x.kids[0]);
-                if (q == NULL){
-                        if (2==sz)
-                        	print("\tst%d R%d,'O',sp,(%d+1); arg+f**\n",sz,src, p->syms[2]->u.c.v.i, "wl"[sz==4], src, p->syms[2]->u.c.v.i); //17-02-05 1802
-                        else 
-                        	print("\tst%d RL%d,'O',sp,(%d+1); arg+f**\n",sz,src, p->syms[2]->u.c.v.i);      //17-02-05 1806            
-                }
+                if (2==sz)
+                        print("\tst2 R%d,'D',ARGBUF+%d,0 ;store outgoing arg into fixed RAM argument area\n",src, p->syms[2]->u.c.v.i);
+                else
+                        print("\tst4 RL%d,'D',ARGBUF+%d,0 ;store outgoing arg into fixed RAM argument area\n",src, p->syms[2]->u.c.v.i);
                 break;
         case ASGN+B:
 		fprintf(stderr,"ASGN+B\n");
@@ -975,15 +1053,18 @@ static void emit2(Node p) {
                 break;
        }
 }
+/* All C-level arguments live in the fixed ARGBUF memory area now, so this no
+   longer picks a hardware register; it only checks that the argument list
+   fits in ARGBUF_SIZE.  Kept as a function (instead of inlining the check)
+   so every call site; target(), emit2(), function(); enforces the same
+   limit the same way. argno/ty0 are unused but kept so the three call sites
+   don't need to change shape. */
 static Symbol argreg(int argno, int offset, int ty, int sz, int ty0) {
         assert((offset&1) == 0);
-        //print(";argreg(argno=%d,offset=%d,ty=%d,sz=%d ",argno,offset,ty,sz);
-        if (offset + sz > 2*NUM_ARG_REGS || !(ty == I || ty == U || ty == P||ty==F)) //wjr
-                {/*print(" ret null\n");*/ return NULL;}
-        else if (argno == 0 && sz == 4)
-                {/*print(" ret p1p2\n");*/ return rp1p2;}
-        else
-                {/*print(" ret %d\n",ireg[(offset/2) + REG_FIRST_ARG]); */ return ireg[(offset/2) + REG_FIRST_ARG];}
+        if (offset + sz > ARGBUF_SIZE)
+                error("argument list needs %d bytes, but only %d are available in the fixed ARGBUF area (see ARGBUF_SIZE)\n",
+                        offset + sz, ARGBUF_SIZE);
+        return NULL;
 }
 static void doarg(Node p) {
         static int argno;
@@ -1024,8 +1105,7 @@ static void genrldregs(){ //reload any saved registers
 }
 
 static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
-        int i, saved, sizefsave, sizeisave, varargs;
-        Symbol r, argregs[NUM_ARG_REGS];
+        int i, sizefsave, sizeisave, varargs;
 
         usedmask[0] = usedmask[1] = 0;
         freemask[0] = freemask[1] = ~(unsigned)0;
@@ -1035,54 +1115,53 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
         varargs = variadic(f->type) //set the flag for variable arguments if the function is typed variadic 
                 || i > 0 && strcmp(callee[i-1]->name, "va_alist") == 0; //or if the last argument is "va_alist"
 
-	//this loop scans the arguments to assign offsets and	//
-	//to see if they can stay in their registers or 	//
-	//move to new registers or go on the stack		//
+	//this loop assigns every parameter its byte offset inside the fixed
+	//ARGBUF area; that's where the caller already deposited the value
+	//(see emit2()'s ARG+x case); and decides whether the callee keeps
+	//its own copy of the value in a register instead of re-reading it
+	//from ARGBUF every time; unlike the old register-window scheme this
+	//is no longer limited to the first couple of parameters, since every
+	//parameter arrives in memory now.
 	for (i = 0; callee[i]; i++) {
                 Symbol p = callee[i];
                 Symbol q = caller[i];
                 assert(q);
-                offset = roundup(offset, q->type->align);	//even arguments that come in registers get an offset
-                p->x.offset = q->x.offset = offset;
+                offset = roundup(offset, q->type->align);
+                p->x.offset = q->x.offset = offset;	//byte offset within ARGBUF
                 p->x.name = q->x.name = stringd(offset);
-                r = argreg(i, offset, optype(ttob(q->type)), q->type->size, optype(ttob(caller[0]->type)));
-                if (i < NUM_ARG_REGS)
-                        argregs[i] = r;
                 offset = roundup(offset + q->type->size, 2);
-                if (varargs)	//for variadic functions the arguments are auto
-                        p->sclass = AUTO;
-                else if (r && ncalls == 0 &&
-                         !isstruct(q->type) && !p->addressed &&
-                         !(isfloat(q->type) && r->x.regnode->set == IREG)) {
-                        p->sclass = q->sclass = REGISTER;
-                        askregvar(p, r);
-                        assert(p->x.regnode && p->x.regnode->vbl == p);
-                        q->x = p->x;
-                        q->type = p->type;
-                }
-                else if (askregvar(p, rmap(ttob(p->type))) //this last case assigns a new register
-                         && r != NULL
-                         && (isint(p->type) || p->type == q->type)) {
-                        assert(q->sclass != REGISTER);
-                        p->sclass = q->sclass = REGISTER;
-                        q->type = p->type;
+                if (!varargs && !isstruct(q->type) && !p->addressed) {
+                        p->sclass = REGISTER;	//askregvar() requires this to already be set; it
+                                                //downgrades back to AUTO itself if no register is free
+                        if (askregvar(p, rmap(ttob(p->type)))) {
+                                q->sclass = REGISTER;
+                                q->type = p->type;
+                        } else
+                                q->sclass = AUTO;
+                } else {
+                        p->sclass = q->sclass = AUTO;
                 }
         }
         assert(!caller[i]);
+        if (offset > ARGBUF_SIZE)
+                error("%s needs %d bytes of arguments; only %d are available in the fixed ARGBUF area (see ARGBUF_SIZE)\n",
+                        f->name, offset, ARGBUF_SIZE);
+
         offset = 2; //wjr jan 8 allow for spot taken by saved return address
         gencode(caller, callee);  //while generating the dag tree, gencode will set offsets for locals,
         			//count calls in ncalls and mark what registers are used in usedmask
         usedmask[IREG] &= INT_CALLEE_SAVE;	//limit regs to be saved to those the callee is responsible for (basically the variables)
         usedmask[FREG] &= 0x00000000;		//not saving the float temps
-        maxargoffset = roundup(maxargoffset, usedmask[FREG] ? 8 : 2);	//round up the arg area if floats are saved
-        if (ncalls && maxargoffset < NUM_ARG_REGS*2)	//if we do calls, always leave at least enough room to save all the argument registers
-                maxargoffset = NUM_ARG_REGS*2;
-        //we now know we need maxargoffset bytes for outgoing arguments
+        //maxargoffset (the largest *outgoing* argument list this function
+        //itself builds for calls it makes) no longer needs a home in this
+        //function's own frame: outgoing arguments go to the shared, fixed
+        //ARGBUF area instead of a per-call stack slot, so it plays no part
+        //in framesize any more; one less thing every call-making function
+        //has to carry around.
         sizefsave = 4*bitcount(usedmask[FREG]);
         sizeisave = 2*bitcount(usedmask[IREG]);
-        framesize = maxargoffset 	//the frame includes the outgoing argument area, 
-                + sizefsave + sizeisave 	//the float and int reg save areas,
-                + roundup(maxoffset, 2);       		// and the area for locals
+        framesize = sizefsave + sizeisave 	//the float and int reg save areas,
+                + roundup(maxoffset, 2);       	// and the area for locals
  	print(";;function_start %s %t\n",f->x.name, f->type);
         printf("%s:\t\t;framesize=%d\n", f->x.name,framesize); //wjr june 27 2013
         if (framesize > 2) { 
@@ -1091,76 +1170,63 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
         				print("\treserve %d; save room for local variables\n", roundup(maxoffset,2)-2);
         			}
 				gensaveregs(); //save the registers
-				if (maxargoffset>0) {
-					print("\treserve %d; save room for outgoing arguments\n", maxargoffset);
-				}
 			} else {
 				print("\treserve %d\n", framesize-2); //just reserve the stack frame 
 			}
         }
 
-
-
-        for (i = 0; i < NUM_ARG_REGS && callee[i]; i++) {  //this loop is all about assigning locations for the incoming parameter registers
-                r = argregs[i];
-                if (r && r->x.regnode != callee[i]->x.regnode) {
-                        Symbol out = callee[i];
-                        Symbol in  = caller[i];
-                        int rn = r->x.regnode->number;
-                        int rs = r->x.regnode->set;
-                        int tyin = ttob(in->type);
-
-                        assert(out && in && r && r->x.regnode);
-                        assert(out->sclass != REGISTER || out->x.regnode);
-                        if (out->sclass == REGISTER
-                        && (isint(out->type) || out->type == in->type)) {	//this is about moving an arg register to another register
-                                int outn = out->x.regnode->number;
-                                /*Oct 12 eliminate refs to float regs - I don't use them
-                                if (rs == FREG && tyin == F+sizeop(8))
-                                        print("mov.d rf%d,rf%d\n", outn, rn);
-                                else if (rs == FREG && tyin == F+sizeop(4))
-                                        print("mov.s rf%d,rf%d\n", outn, rn);
-                                else if (rs == IREG && tyin == F+sizeop(8))
-                                        print("mtc1.d R%d,rf%d\n", rn,   outn);
-                                else 
-                                Oct 12 */
-                                if (rs == IREG && tyin == F+sizeop(4))
-                                        print("\tcpy4 RL%d,RL%d; halfbaked&floaty\n",   outn,rn);//print("mtc1 R%d,rf%d\n",   rn,   outn);
-                                else if (rs == IREG && tyin == I+sizeop(4))
-                                        print("\tcpy4 RL%d,RL%d; halfbaked\n",   outn,rn);
-                                else if (rs == IREG && tyin == U+sizeop(4))
-                                        print("\tcpy4 RL%d,RL%d; halfbaked\n",   outn,rn);
-                                else
-                                        print("\tcpy2 R%d,R%d; function(%d) 1\n",    outn, rn,tyin);
-                        } else {
-                                int off = in->x.offset + framesize;
-                                /*oct 12 eliminate refs to FREG
-                                if (rs == FREG && tyin == F+sizeop(8))
-                                        print("pigs s.d rf%d,%d(sp)\n", rn, off); //cannot get here
-                                else if (rs == FREG && tyin == F+sizeop(4))
-                                        print("frogs s.s rf%d,%d(sp)\n", rn, off); //cannot get here
-                                else 
-                                Oct 12*/
-                                {	//this is about saving arg registers in the caller's frame
-                                        int i, n = (in->type->size + 1)/2;
-                                        //print("hey hey rn=%d,n=%d,REG_LAST_ARG=%d\n",rn,n,REG_LAST_ARG);
-                                        for (i = rn; i < rn+n && i <= REG_LAST_ARG; i++)
-                                                print("\tst2 R%d,'O',sp,(%d+1); flag1 \n", i, off + (i-rn)*2);//17-02-05 1802
-                                }
-                        }
+        //Copy every incoming parameter out of the shared ARGBUF area before
+        //the body runs and possibly calls something else (recursively or
+        //not): a nested call's own outgoing arguments reuse these very same
+        //ARGBUF bytes, so anything left unread there would be clobbered.
+        //Parameters bound to a register just get loaded straight into it;
+        //everything else lands in this function's own frame, at the same
+        //offset (relative to framesize) that the ADDRFP2 rule's "%A" format
+        //already expects for any other reference to it in the body.
+        for (i = 0; callee[i]; i++) {
+                Symbol p = callee[i];
+                int off = p->x.offset;
+                int islong = caller[i]->type->size == 4;
+                if (p->sclass == REGISTER) {
+                        int rn = p->x.regnode->number;
+                        if (islong)
+                                print("\tld4 RL%d,'D',ARGBUF+%d,0 ;fetch arg from fixed RAM argument area\n", rn, off);
+                        else
+                                print("\tld2 R%d,'D',ARGBUF+%d,0 ;fetch arg from fixed RAM argument area\n", rn, off);
+                } else {
+                        int dst = off + framesize;	//same "+framesize" convention the ADDRFP2/%A rule uses
+                        if (islong)
+                                print("\tld4 RL%s,'D',ARGBUF+%d,0\n\tst4 RL%s,'O',sp,(%d+1) ;copy arg from ARGBUF into local frame\n",
+                                        SZ_REG_FIRST_TEMP, off, SZ_REG_FIRST_TEMP, dst);
+                        else
+                                print("\tld2 R%s,'D',ARGBUF+%d,0\n\tst2 R%s,'O',sp,(%d+1) ;copy arg from ARGBUF into local frame\n",
+                                        SZ_REG_FIRST_TEMP, off, SZ_REG_FIRST_TEMP, dst);
                 }
         }
-        if (varargs && callee[i-1]) { //this saves any remaining argument registers in the frame
-                i = callee[i-1]->x.offset + callee[i-1]->type->size;
-                for (i = roundup(i, 2)/2; i < NUM_ARG_REGS; i++)
-                        print("\tst2 R%d,'O',sp,(%d+1); flag2\n", REG_FIRST_ARG + i, framesize + 2*i);//**see bottom** //17-02-05 1802
-                }
+        if (varargs && callee[i-1]) {
+                //Old-style (va_alist) varargs: a single-pass compiler has no
+                //way to know, in general, how many bytes any given call will
+                //pass in the variadic tail. varargmaxfor() gives the largest
+                //total this file's own calls to `f` were seen to use (see
+                //varargtrack() above); tight as long as every call to `f`
+                //was already compiled by this point, which holds whenever
+                //the va_alist function is defined after all its call sites
+                //in the same file (true here: printf() comes from stdlib.c,
+                //#include'd at the very end). Falls back to the full
+                //ARGBUF_SIZE ceiling if no call was seen yet, so this is
+                //never smaller than what's actually safe.
+                int vmax = varargmaxfor(f);
+                int start = roundup(callee[i-1]->x.offset + callee[i-1]->type->size, 2);
+                int j;
+                for (j = start; j < vmax; j += 2)
+                        print("\tld2 R%s,'D',ARGBUF+%d,0\n\tst2 R%s,'O',sp,(%d+1) ;copy vararg tail from ARGBUF\n",
+                                SZ_REG_FIRST_TEMP, j, SZ_REG_FIRST_TEMP, j + framesize);
+        }
+
         emitcode();
+
         if (framesize > 2) { 
         	if (0!=(usedmask[IREG]+usedmask[FREG])){  //if there are regs to restore
-        		if (maxargoffset>0){
-				print("\trelease %d; release room for outgoing arguments\n", maxargoffset);
-			}
 			genrldregs(); //reload the registers
 			if (roundup(maxoffset,2)>2){
 				print("\trelease %d; release room for local variables \n", roundup(maxoffset,2)-2);
@@ -1169,15 +1235,6 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
 			print("\trelease %d\n", framesize-2); //just release the stack frame 
 		}
         }
-/*
-        if (0!=(usedmask[IREG]+usedmask[FREG])) //if there are regs to reload
-        genrldregs(maxargoffset); //tell routine where to start reloading
-
-        if (framesize > 2) { //wjr jan 8 virtual framesize allows for ret addr saved in call
-                print("\trelease %d\n", framesize-2); //wjr jan 14 - release the stack frame 
-        }
- */
-        //print("\tghi 15 ;otherwise SCRT return may mess up R15.1\n"); //20-05-23 moved to cretn
         print("\tCretn\n\n");
  	print(";;function_end$$ %s\n",f->x.name);
 }

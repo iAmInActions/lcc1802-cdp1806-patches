@@ -6,7 +6,8 @@
 ;;function_start IO1802.inc void function(void)
 	pagefit 6
 _putc:
-_out5:	
+_out5:
+	ld2	regArg1,'D',ARGBUF+0,0 ;fetch char arg from fixed RAM argument area
 	glo	regArg1
 	dec	sp
 	str	sp
@@ -15,9 +16,10 @@ _out5:
 	pagefit 26
 _inp:		;raw port input
 		;stores a small tailored program on the stack and executes it
+	ld2	regarg1,'D',ARGBUF+0,0 ;fetch port arg from fixed RAM argument area
 	dec	sp	;work backwards
 	ldi	0xD3	;return instruction
-	stxd		
+	stxd
 	glo	regarg1	;get the port number
 	ani	0x07	;clean it
 	bz	$$no0	; inp(0) isn't valid
@@ -42,9 +44,11 @@ _out:		;raw port output
 		;then SEP sp
 		;the D5 would return to the calling program and finish fixing the stack.
 		;saves 6 instructions but it's a bit tricky.
+	ld2	regarg1,'D',ARGBUF+0,0 ;fetch port arg from fixed RAM argument area
+	ld2	regarg2,'D',ARGBUF+2,0 ;fetch value arg from fixed RAM argument area
 	dec	sp	;work backwards
 	ldi	0xD3	;return instruction
-	stxd		
+	stxd
 	cpy2	rt1,sp	;rt1 will point to the OUT instruction
 	glo	regarg1	;get the port number
 	ani	0x07	;clean it
