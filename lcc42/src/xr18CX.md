@@ -97,7 +97,8 @@ saving reg:  CVUI2(INDIRU1(addr))     "\tld1 R%c,%0\n\tzExt R%c ;CVUI2(INDIRU1(a
 #define INTTMP 0x0f00	//8-11 are temporaries
 #define PX3TMP 0x0e00	//9-11 are temporaries
 #define PX3VARS 0x0140	//8,6 for variables
-#define INTVAR 0x00C3	//0-1 6-7 can hold variables 
+#define INTVAR 0x0083	//0-1 7 can hold variables (NOT 6: R6 is REG_RETADDR, clobbered by every SCAL/SRET call on -cpu1805; see REG_RETADDR and the REGS6SAFE mask below)
+#define REGS6SAFE 0xFFBF	//everything except bit 6 (R6/REG_RETADDR); ANDed into vmask after every mode-specific adjustment below, so no flag combination can put a variable in the call-linkage register 
 #define REGSVOLATILE 0x0003	//registers 0 and 1 not available for variables in a volatile environment
 #define REGSPIXIE2 0x0083	//registers 7, 0 and 1 not available for variables in a pixie2 environment
 #define REGS1805 0x0030	//registers 4-5 are available for variables when -cpu1805 specified
@@ -807,6 +808,15 @@ static void progbeg(int argc, char *argv[]) {
         	fprintf(stderr,"1805 register variables\n");
         	vmask[IREG] = vmask[FREG] | REGS1805; //allow 4&5
         }
+        	/* R6 is REG_RETADDR: every Ccall/Cretn (SCAL 6 / SRET 6 on -cpu1805,
+        	   see lcc1802proloCX.inc) clobbers it as the call-linkage register,
+        	   so no mode above may leave it eligible for ordinary variable
+        	   storage; a variable placed there survives only until the next
+        	   function call anywhere in its scope, then silently reads back
+        	   garbage. Enforced unconditionally here rather than trusting each
+        	   branch above (INTVAR, REGSPIXIE2, PX3VARS) to individually keep
+        	   excluding it, since that's exactly how this got missed before. */
+        	vmask[IREG] &= REGS6SAFE; vmask[FREG] &= REGS6SAFE;
         // fprintf(stderr,"Register mask for variables %X\n",vmask[IREG]);
         blkreg = mkreg(SZ_REG_FIRST_TEMP, REG_FIRST_TEMP, 7, IREG);	//which regs to use for block copies and moves
 }
