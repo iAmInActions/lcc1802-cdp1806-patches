@@ -137,6 +137,14 @@ saving reg:  CVUI2(INDIRU1(addr))     "\tld1 R%c,%0\n\tzExt R%c ;CVUI2(INDIRU1(a
 				   the smallest value that covers every call in the program. */
 
 #define INT_CALLEE_SAVE INTVAR  //wjr jan 8 return address is saved in the call - save only the intvars
+	/* NOT used directly by function() below anymore; see the comment at
+	   its one use site (usedmask[IREG] &= vmask[IREG]) for why: this
+	   static macro never reflected -cpu1805's REGS1805 addition (regs
+	   4-5), so any function whose R4/R5 "register variable" needed to
+	   survive a nested call was never actually saved/restored, silently
+	   corrupting whatever the *caller* had stored there. Left defined
+	   (unused) rather than deleted, in case something else still
+	   references the name. */
 
 #define readsreg(p) \
         (generic((p)->op)==INDIR && (p)->kids[0]->op==VREG+P)
@@ -1115,7 +1123,7 @@ static void genrldregs(){ //reload any saved registers
 }
 
 static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
-        int i, sizefsave, sizeisave, varargs;
+        int i, sizefsave, sizeisave, varargs, retlink;
 
         usedmask[0] = usedmask[1] = 0;
         freemask[0] = freemask[1] = ~(unsigned)0;
@@ -1157,10 +1165,70 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
                 error("%s needs %d bytes of arguments; only %d are available in the fixed ARGBUF area (see ARGBUF_SIZE)\n",
                         f->name, offset, ARGBUF_SIZE);
 
-        offset = 2; //wjr jan 8 allow for spot taken by saved return address
+        /* retlink: how much phantom space to reserve, right above the local
+           frame, for the caller's return-linkage word(s); see below.
+           Only matters for functions that emit a parameter copy-out (any
+           AUTO-class callee[], or a vararg tail): those are the only ones
+           whose prologue writes into this phantom area at all. Everyone
+           else keeps the original 2-byte reservation, unchanged.
+
+           A plain SCAL-based call (CcallD, used for every direct call in
+           this codebase) leaves exactly one linkage word; the return
+           address; sitting right above the callee's own frame, and the
+           original code sized this phantom gap for exactly that (offset=2).
+
+           But a function reached through the app-side syscall trampolines
+           (Ccall *R9, see syscall.inc / the "Ccall addr" indirect-call
+           macro in lcc1802proloCX.inc) is entered with a *second* linkage
+           word above that: the trampoline's own "pushr r6" (it must save
+           the real return address somewhere while it borrows R6 to jump
+           through R9, then SRET's built-in pop restores it). A parameter
+           copy-out sized for only one linkage word writes its first 2
+           bytes squarely on top of that second word; the *caller's own*
+           saved-R6 link, needed only once this function returns; with
+           whatever stale bytes happen to be sitting past ARGBUF's actually-
+           used prefix. The caller then returns into garbage.
+           Root-caused by tracing a minimal repro (app code calling a
+           variadic BIOS function; printf(); through the syscall
+           trampoline, from a helper that is itself called, not inlined
+           into main()) against the emulator instruction-by-instruction:
+           R6 at the corrupted return matched exactly the address that had
+           been loaded as printf's own string-literal argument moments
+           earlier, i.e. leftover ARGBUF bytes from a prior call, landing
+           exactly 3 bytes above the callee's entry SP as predicted by this
+           formula. Any C function can potentially be reached both directly
+           and through a trampoline (same compiled body either way), so the
+           extra word must be reserved unconditionally for any function
+           that copies a parameter out of ARGBUF; the compiler can't know
+           at compile time which calling path a given call site will use. */
+        retlink = varargs ? 4 : 2;
+        for (i = 0; !varargs && callee[i]; i++)
+                if (callee[i]->sclass == AUTO)
+                        retlink = 4;
+
+        offset = retlink; //wjr jan 8 allow for spot taken by saved return address
         gencode(caller, callee);  //while generating the dag tree, gencode will set offsets for locals,
         			//count calls in ncalls and mark what registers are used in usedmask
-        usedmask[IREG] &= INT_CALLEE_SAVE;	//limit regs to be saved to those the callee is responsible for (basically the variables)
+        /* Which regs actually get pushed/popped in this function's own
+           prologue/epilogue if it uses them, i.e. which "variable"
+           registers a caller can trust to survive a call to this
+           function. MUST track vmask[IREG]; the SAME mask the
+           register allocator (askregvar(), rmap(), local()) actually
+           hands out variables from; not a fixed subset of it: any
+           register the allocator considers fair game for a variable has
+           to be saved here too, or a callee that happens to reuse that
+           physical register for its OWN variable/parameter silently
+           clobbers the caller's value with no save/restore in between.
+           This used to be the static macro INT_CALLEE_SAVE (== INTVAR),
+           which missed REGS1805 (registers 4-5, added to vmask below
+           under -cpu1805) entirely; e.g. sd_command()'s own `arg`
+           parameter landing in R4:R5 would clobber sd_write_block()'s
+           `block` argument, also R4:R5, the instant sd_command() was
+           entered. See gpio-img-test/marta-test.c's R6 bug (a related,
+           earlier-fixed instance of the same class of mistake: a
+           register eligible for variables that the calling convention
+           doesn't actually protect) for the general shape of this bug. */
+        usedmask[IREG] &= vmask[IREG];
         usedmask[FREG] &= 0x00000000;		//not saving the float temps
         //maxargoffset (the largest *outgoing* argument list this function
         //itself builds for calls it makes) no longer needs a home in this
@@ -1174,14 +1242,14 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
                 + roundup(maxoffset, 2);       	// and the area for locals
  	print(";;function_start %s %t\n",f->x.name, f->type);
         printf("%s:\t\t;framesize=%d\n", f->x.name,framesize); //wjr june 27 2013
-        if (framesize > 2) { 
+        if (framesize > retlink) { 
         		if (0!=(usedmask[IREG]+usedmask[FREG])){  //if there are regs to save
-        			if (roundup(maxoffset,2)>2){
-        				print("\treserve %d; save room for local variables\n", roundup(maxoffset,2)-2);
+        			if (roundup(maxoffset,2)>retlink){
+        				print("\treserve %d; save room for local variables\n", roundup(maxoffset,2)-retlink);
         			}
 				gensaveregs(); //save the registers
 			} else {
-				print("\treserve %d\n", framesize-2); //just reserve the stack frame 
+				print("\treserve %d\n", framesize-retlink); //just reserve the stack frame 
 			}
         }
 
@@ -1235,14 +1303,14 @@ static void function(Symbol f, Symbol caller[], Symbol callee[], int ncalls) {
 
         emitcode();
 
-        if (framesize > 2) { 
+        if (framesize > retlink) { 
         	if (0!=(usedmask[IREG]+usedmask[FREG])){  //if there are regs to restore
 			genrldregs(); //reload the registers
-			if (roundup(maxoffset,2)>2){
-				print("\trelease %d; release room for local variables \n", roundup(maxoffset,2)-2);
+			if (roundup(maxoffset,2)>retlink){
+				print("\trelease %d; release room for local variables \n", roundup(maxoffset,2)-retlink);
 			}
 		} else {
-			print("\trelease %d\n", framesize-2); //just release the stack frame 
+			print("\trelease %d\n", framesize-retlink); //just release the stack frame 
 		}
         }
         print("\tCretn\n\n");
