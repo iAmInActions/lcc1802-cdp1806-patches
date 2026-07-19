@@ -424,7 +424,7 @@ $$shift:
 
 	align 256
 	if $ = 07F00h
-	    org $+0100h	;0x7F00 is reserved for the syscall vector table BIOS_GPU.c's syscall() builds with "ORG 0x7F00", dont let a page aligned routine land on top of it
+	    org $+0100h	;0x7F00 is reserved for the syscall vector table BIOS_GPU.c's syscall() builds with "ORG 0x7F00" -- don't let a page-aligned routine land on top of it
 	endif
 ;signed integer division RL8=RL8/RL10, remainder in Rp1p2
 ;uses unsigned division of absolute values then negates the quotient if the signs were originally different

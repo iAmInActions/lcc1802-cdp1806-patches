@@ -824,6 +824,7 @@ static void oldparam(Symbol p, void *cl) {
 void compound(int loop, struct swtch *swp, int lev) {
 	Code cp;
 	int nregs;
+	List saved_autos, saved_registers;
 
 	walk(NULL, 0, 0);
 	cp = code(Blockbeg);
@@ -833,6 +834,29 @@ void compound(int loop, struct swtch *swp, int lev) {
 		apply(events.entry, cfunc, NULL);
 	definept(NULL);
 	expect('{');
+	/* autos/registers are a single pair of file-scope accumulator lists,
+	   not stacked per nesting level, because the original two-loop shape
+	   (all decls, then a single ltov() capturing them into
+	   cp->u.block.locals, then all statements) guaranteed every nested
+	   compound() -- reachable only from the statement half, via
+	   statement()'s '{'/if/while/for/... cases -- could only start after
+	   the enclosing scope's own accumulation was already flushed. Mixed
+	   declarations (see the merged loop below) break that: a nested
+	   block, e.g. a for-loop body, can now run *before* the enclosing
+	   scope has seen all its own declarations, and it unconditionally
+	   resets autos/registers to NULL for its own use -- wiping out
+	   whatever the enclosing scope had accumulated so far, silently
+	   dropping those locals from its cp->u.block.locals (they'd never
+	   get a codegen-side slot at all: found by a crash decoding a NULL
+	   x.name for a variable's own zero-initializer, for a variable
+	   declared and used entirely before any mixed-declaration feature
+	   came into play -- the reset alone was already reachable from a
+	   plain trailing block, mixed declarations just made it common).
+	   Save/restore across the recursion, same idea as any other
+	   recursive-descent state a nested call must not clobber for its
+	   caller. */
+	saved_autos = autos;
+	saved_registers = registers;
 	autos = registers = NULL;
 	if (level == LOCAL && IR->wants_callb
 	&& isstruct(freturn(cfunc->type))) {
@@ -841,9 +865,37 @@ void compound(int loop, struct swtch *swp, int lev) {
 		retv->ref = 1;
 		registers = append(retv, registers);
 	}
-	while (kind[t] == CHAR || kind[t] == STATIC
-	|| istypename(t, tsym) && getchr() != ':')
-		decl(dcllocal);
+	/* Mixed declarations: a declaration is allowed anywhere a statement
+	   is (C99 6.8.2p2), not just as a block-leading run before the first
+	   statement. The two original loops (all decls, then all statements)
+	   are merged into one that re-checks "is this a declaration?" on
+	   every iteration instead of only before the first statement; for a
+	   traditionally-shaped function (every decl before every statement)
+	   this behaves identically to the original two-loop form, since the
+	   decl-branch keeps firing until declarations run out and then the
+	   statement-branch takes over, exactly as before.
+	   `autos`/`registers` are plain accumulator lists appended to by
+	   dcllocal() regardless of when it's called (see its AUTO/REGISTER
+	   cases) -- decl()'s parse-time position doesn't affect their
+	   correctness, so the single ltov() pass that turns them into
+	   cp->u.block.locals just needs to happen once, after every
+	   declaration in the block (wherever it appeared) has been seen,
+	   i.e. after the merged loop instead of between the two old ones.
+	   Symbol scoping is unaffected either way: install() (called from
+	   dcllocal()) already only makes a name visible for lookups from its
+	   declaration point onward, so referencing a variable before its
+	   (now possibly mid-block) declaration is correctly rejected same as
+	   plain C99 block scoping, with no extra work needed here. */
+	for (;;) {
+		int isdecl = kind[t] == CHAR || kind[t] == STATIC
+			|| istypename(t, tsym) && getchr() != ':';
+		if (isdecl)
+			decl(dcllocal);
+		else if (kind[t] == IF || kind[t] == ID)
+			statement(loop, swp, lev);
+		else
+			break;
+	}
 	{
 		int i;
 		Symbol *a = ltov(&autos, STMT);
@@ -852,10 +904,14 @@ void compound(int loop, struct swtch *swp, int lev) {
 			registers = append(a[i], registers);
 		cp->u.block.locals = ltov(&registers, FUNC);
 	}
+	/* This scope's own locals are now safely captured in
+	   cp->u.block.locals; hand the accumulator back to whichever
+	   enclosing compound() (if any) was mid-accumulation when it called
+	   into this one -- see the save above. */
+	autos = saved_autos;
+	registers = saved_registers;
 	if (events.blockentry)
 		apply(events.blockentry, cp->u.block.locals, NULL);
-	while (kind[t] == IF || kind[t] == ID)
-		statement(loop, swp, lev);
 	walk(NULL, 0, 0);
 	foreach(identifiers, level, checkref, NULL);
 	{
@@ -892,6 +948,76 @@ void compound(int loop, struct swtch *swp, int lev) {
 		exitscope();
 		expect('}');
 	}
+}
+/* C99 6.8.5.3: a for-loop's init-clause may be a declaration instead of
+   an expression (for(int i=0;...)), scoped to just the loop -- the
+   condition, increment, and body -- not the enclosing block. forstmt()
+   (stmt.c) implements that as an implicit nested scope wrapping the
+   whole for-statement, built the same way compound() builds an
+   explicit `{ ... }` scope: same Blockbeg/Blockend markers, same
+   autos/registers save-reset-restore dance (see compound()'s own
+   comment on why that save/restore is required), same final
+   locals-capture and ref-count sort. It's split into three pieces
+   instead of being folded into compound() itself because there's no
+   '{'/'}' pair here to `expect()`, no possibility of this being the
+   function's own outermost (level == LOCAL) block, and only ever
+   exactly one declaration to parse rather than compound()'s
+   decl-or-statement loop -- three real shape differences, not just a
+   style choice, so duplicating the ~15 lines that do differ was less
+   risky than adding flags to compound() to suppress them.
+   autos/registers/checkref()/decl()/dcllocal() all stay private to
+   this file (as they already were before this existed) -- forstmt()
+   only sees this trio via their extern declarations in c.h. */
+Code beginforscope(List *save_autos, List *save_registers) {
+	Code cp;
+
+	walk(NULL, 0, 0);
+	cp = code(Blockbeg);
+	enterscope();
+	*save_autos = autos;
+	*save_registers = registers;
+	autos = registers = NULL;
+	return cp;
+}
+void forinitdecl(void) {
+	decl(dcllocal);
+}
+void endforscope(Code cp, List save_autos, List save_registers) {
+	int nregs;
+
+	{
+		int i;
+		Symbol *a = ltov(&autos, STMT);
+		nregs = length(registers);
+		for (i = 0; a[i]; i++)
+			registers = append(a[i], registers);
+		cp->u.block.locals = ltov(&registers, FUNC);
+	}
+	autos = save_autos;
+	registers = save_registers;
+	if (events.blockentry)
+		apply(events.blockentry, cp->u.block.locals, NULL);
+	walk(NULL, 0, 0);
+	foreach(identifiers, level, checkref, NULL);
+	{
+		int i = nregs, j;
+		Symbol p;
+		for ( ; (p = cp->u.block.locals[i]) != NULL; i++) {
+			for (j = i; j > nregs
+				&& cp->u.block.locals[j-1]->ref < p->ref; j--)
+				cp->u.block.locals[j] = cp->u.block.locals[j-1];
+			cp->u.block.locals[j] = p;
+		}
+	}
+	if (events.blockexit)
+		apply(events.blockexit, cp->u.block.locals, NULL);
+	cp->u.block.level = level;
+	cp->u.block.identifiers = identifiers;
+	cp->u.block.types = types;
+	code(Blockend)->u.begin = cp;
+	if (reachable(Gen))
+		definept(NULL);
+	exitscope();
 }
 static void checkref(Symbol p, void *cl) {
 	if (p->scope >= PARAM

@@ -428,6 +428,13 @@ extern Node newnode(int op, Node left, Node right, Symbol p);
 extern Tree cvtconst(Tree);
 extern void printdag(Node, int);
 extern void compound(int, Swtch, int);
+/* Support for a C99 for-loop init-clause declaration (for(int i=0;...)),
+   scoped to just the loop -- see their definitions in decl.c, next to
+   compound(), for why they exist and what they do. Used only by
+   forstmt() in stmt.c. */
+extern Code beginforscope(List *save_autos, List *save_registers);
+extern void forinitdecl(void);
+extern void endforscope(Code cp, List save_autos, List save_registers);
 extern void defglobal(Symbol, int);
 extern void finalize(void);
 extern void program(void);

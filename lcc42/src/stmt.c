@@ -214,7 +214,17 @@ void statement(int loop, Swtch swp, int lev) {
 						break;
 
 	}
+	/* Mixed declarations (see decl.c's compound()): a declaration can
+	   legally follow a statement now, so a type-keyword (kind CHAR:
+	   int/char/struct/...) or storage-class keyword (kind STATIC:
+	   static/extern/register/typedef/auto) here is not an error.
+	   Typename-starting declarations don't need a separate case: a
+	   typedef'd name is lexically an ID, already accepted below, and
+	   compound()'s own lookahead (istypename()+':') is what tells those
+	   apart from a label -- this check only needs to not misfire, not
+	   redo that disambiguation itself. */
 	if (kind[t] != IF && kind[t] != ID
+	&& kind[t] != CHAR && kind[t] != STATIC
 	&& t != '}' && t != EOI) {
 		static char stop[] = { IF, ID, '}', 0 };
 		error("illegal statement termination\n");
@@ -269,11 +279,22 @@ static void forstmt(int lab, Swtch swp, int lev) {
 	int once = 0;
 	Tree e1 = NULL, e2 = NULL, e3 = NULL;
 	Coordinate pt2, pt3;
+	int hasscope = 0;
+	Code forcp = NULL;
+	List saved_autos = NULL, saved_registers = NULL;
 
 	t = gettok();
 	expect('(');
 	definept(NULL);
-	if (kind[t] == ID)
+	/* C99 6.8.5.3: the init-clause may be a declaration instead of an
+	   expression, e.g. for(int i=0;...), scoped to just this loop --
+	   see beginforscope()/forinitdecl()/endforscope() in decl.c. */
+	if (kind[t] == CHAR || kind[t] == STATIC
+	|| istypename(t, tsym) && getchr() != ':') {
+		hasscope = 1;
+		forcp = beginforscope(&saved_autos, &saved_registers);
+		forinitdecl();
+	} else if (kind[t] == ID)
 		e1 = texpr(expr0, ';', FUNC);
 	else
 		expect(';');
@@ -313,6 +334,8 @@ static void forstmt(int lab, Swtch swp, int lev) {
 	}
 	if (findlabel(lab + 2)->ref)
 		definelab(lab + 2);
+	if (hasscope)
+		endforscope(forcp, saved_autos, saved_registers);
 }
 
 static void asmstmt(int lab, Swtch swp, int lev) { //wjr jan 31 43 lines
