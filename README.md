@@ -1,4 +1,14 @@
-# LCC1802
+# LCC1806
+
+A fork of the LCC1802 ANSI C compiler, which adds better CDP1806 support and C99 features.
+
+!!!WIP!!!
+
+TODO: Write proper readme and documentation for updated compiler
+
+---
+
+# Original Readme
 
 An ANSI C Compiler for the RCA 1802 family of processors
 
