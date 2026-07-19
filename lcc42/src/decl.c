@@ -8,6 +8,14 @@ static char rcsid[] = "$Id: decl.c,v 1.1 2002/08/28 23:12:42 drh Exp $";
 static int regcount;
 
 static List autos, registers;
+/* VLA-declared locals (see dcllocal()'s is_vla handling) awaiting an
+   auto-free at the end of their own block -- accumulated and consumed
+   the same way autos/registers are, including the same save/restore
+   dance in compound() around a nested scope (see that function's own
+   comment for why: a nested block's compound() call resets its
+   accumulators unconditionally, so whatever the enclosing scope had
+   pending would otherwise be lost the moment a nested block runs). */
+static List vla_pending;
 Symbol cfunc;		/* current function */
 Symbol retv;		/* return value location for structs */
 
@@ -23,10 +31,11 @@ static void doglobal(Symbol, void *);
 static void doextern(Symbol, void *);
 static void exitparams(Symbol []);
 static void fields(Type);
-static void funcdefn(int, char *, Type, Symbol [], Coordinate);
+static void funcdefn(int, char *, Type, Symbol [], Coordinate, int);
 static void initglobal(Symbol, int);
 static void oldparam(Symbol, void *);
 static Symbol *parameters(Type);
+static void parse_inline_body(Symbol, Symbol []);
 static Type specifier(int *);
 static Type structdcl(int);
 static Type tnode(int, Type);
@@ -51,16 +60,50 @@ void program(void) {
 	if (n == 0)
 		warning("empty input file\n");
 }
+/* Set by specifier() whenever it consumes an `inline` specifier, valid
+   until the next specifier() call; decl() reads it right after calling
+   specifier() to decide whether the function it's about to parse (if
+   this turns out to be a function definition at all) should go through
+   parse_inline_body() instead of the normal compound()/codegen path.
+   Not threaded through specifier()'s own return value/sclass out-param
+   since `inline` is orthogonal to storage class (e.g. `static inline`
+   is legal) and every other specifier() caller can just ignore it. */
+static int seen_inline;
+
+/* === VLA support (see dclr1()'s '[' case, and vla_rewrite() near
+   dcllocal()) ===
+   in_local_declarator: true only while parsing a *local* variable's
+   own declarator (decl() sets it based on whether dcllocal is the
+   `dcl` callback it was given -- see compound()'s decl(dcllocal) call
+   -- so it's false for parameters (dclparam), struct fields (fields()
+   never goes through decl() at all), and globals). A non-constant
+   array size is only meaningful -- and only handled -- while this is
+   true; everywhere else the existing intexpr()-based "must be
+   constant" error still applies unchanged.
+   vla_size_tree / is_vla: single-slot handoff from dclr1() (which
+   parses the size expression, deep inside dclr()'s recursion, with no
+   direct path back to dcllocal()) to dcllocal() (which does the actual
+   rewrite once the full declarator and its Symbol both exist). Safe as
+   plain globals rather than something reentrant: array declarators
+   don't nest (you can't write a VLA bound *inside* another array
+   bound's brackets), and is_vla is consumed (reset to 0) immediately
+   after dcllocal() reads it. */
+static int in_local_declarator;
+static Tree vla_size_tree;
+static int is_vla;
+
 static Type specifier(int *sclass) {
 	int cls, cons, sign, size, type, vol;
 	Type ty = NULL;
 
 	cls = vol = cons = sign = size = type = 0;
+	seen_inline = 0;
 	if (sclass == NULL)
 		cls = AUTO;
 	for (;;) {
 		int *p, tt = t;
 		switch (t) {
+		case INLINE:   seen_inline = 1; t = gettok(); continue;
 		case AUTO:
 		case REGISTER: if (level <= GLOBAL && cls == 0)
 		               	error("invalid use of `%k'\n", t);
@@ -142,11 +185,12 @@ static Type specifier(int *sclass) {
 	return ty;
 }
 static void decl(Symbol (*dcl)(int, char *, Type, Coordinate *)) {
-	int sclass;
+	int sclass, is_inline;
 	Type ty, ty1;
 	static char stop[] = { CHAR, STATIC, ID, 0 };
 
 	ty = specifier(&sclass);
+	is_inline = seen_inline;
 	if (t == ID || t == '*' || t == '(' || t == '[') {
 		char *id;
 		Coordinate pos;
@@ -155,6 +199,8 @@ static void decl(Symbol (*dcl)(int, char *, Type, Coordinate *)) {
 		if (level == GLOBAL) {
 			Symbol *params = NULL;
 			ty1 = dclr(ty, &id, &params, 0);
+			if (is_inline && !isfunc(ty1))
+				error("`inline' is only valid on a function\n");
 			if (params && id && isfunc(ty1)
 			    && (t == '{' || istypename(t, tsym)
 			    || (kind[t] == STATIC && t != TYPEDEF))) {
@@ -162,14 +208,20 @@ static void decl(Symbol (*dcl)(int, char *, Type, Coordinate *)) {
 					error("invalid use of `typedef'\n");
 					sclass = EXTERN;
 				}
-				if (ty1->u.f.oldstyle)
+				if (ty1->u.f.oldstyle) {
+					if (is_inline)
+						error("inline function `%s' must use ANSI-style parameters, not an old-style definition\n", id);
 					exitscope();
-				funcdefn(sclass, id, ty1, params, pos);
+				}
+				funcdefn(sclass, id, ty1, params, pos, is_inline && !ty1->u.f.oldstyle);
 				return;
 			} else if (params)
 				exitparams(params);
-		} else
+		} else {
+			in_local_declarator = (dcl == dcllocal);
 			ty1 = dclr(ty, &id, NULL, 0);
+			in_local_declarator = 0;
+		}
 		for (;;) {
 			if (Aflag >= 1 && !hasproto(ty1))
 				warning("missing prototype\n");
@@ -377,10 +429,40 @@ static Type dclr1(char **id, Symbol **params, int abstract) {
 		          break;
 		case '[': t = gettok(); { int n = 0;
 					  if (kind[t] == ID) {
-					  	n = intexpr(']', 1);
-					  	if (n <= 0) {
-					  		error("`%d' is an illegal array size\n", n);
-					  		n = 1;
+					  	if (in_local_declarator) {
+					  		/* VLA candidate: parse the bound as an
+					  		   ordinary (not necessarily constant)
+					  		   expression instead of going through
+					  		   intexpr(), which unconditionally rejects
+					  		   anything but a constant. If it *does*
+					  		   turn out to be constant, treat it exactly
+					  		   like the plain-array case always has --
+					  		   only a genuinely non-constant bound goes
+					  		   through the VLA path below, so ordinary
+					  		   `char buf[16];`-style locals are
+					  		   unaffected either way. See dcllocal()
+					  		   for where vla_size_tree/is_vla actually
+					  		   get turned into a malloc() call -- can't
+					  		   be done here, before the declarator even
+					  		   has a name or a Symbol yet. */
+					  		Tree sizeexpr = expr1(']');
+					  		if (sizeexpr->op == CNST+I || sizeexpr->op == CNST+U) {
+					  			n = cast(sizeexpr, inttype)->u.v.i;
+					  			if (n <= 0) {
+					  				error("`%d' is an illegal array size\n", n);
+					  				n = 1;
+					  			}
+					  		} else {
+					  			vla_size_tree = sizeexpr;
+					  			is_vla = 1;
+					  			n = 0;
+					  		}
+					  	} else {
+					  		n = intexpr(']', 1);
+					  		if (n <= 0) {
+					  			error("`%d' is an illegal array size\n", n);
+					  			n = 1;
+					  		}
 					  	}
 					  } else
 					  	expect(']');
@@ -590,7 +672,18 @@ static void fields(Type ty) {
 					error("field name missing\n");
 				else if (isfunc(p->type))
 					error("`%t' is an illegal field type\n", p->type);
-				else if (p->type->size == 0)
+				/* A size-0 array here is either `type name[];` or (see
+				   dclr1() above) an explicit `type name[0]` -- the
+				   latter is rejected right there with its own "illegal
+				   array size" error, so anything reaching this point is
+				   a genuine flexible array member candidate (C99
+				   6.7.2.1p18). Whether it's actually positioned legally
+				   (last field, not the struct's only field) can't be
+				   answered yet -- there may be more fields still to
+				   parse after this one -- so that's deferred to the
+				   field-layout loop below, once every field in this
+				   struct/union is known. */
+				else if (p->type->size == 0 && !isarray(p->type))
 					error("undefined size for field `%t %s'\n",
 						p->type, id);
 			}
@@ -609,7 +702,25 @@ static void fields(Type ty) {
 	  } }
 	{ int bits = 0, off = 0, overflow = 0;
 	  Field p, *q = &ty->u.sym->u.s.flist;
+	  int nfields = 0;
 	  ty->align = IR->structmetric.align;
+	  for (p = *q; p; p = p->link)
+	  	nfields++;
+	  for (p = *q; p; p = p->link)
+	  	if (isarray(p->type) && p->type->size == 0) {
+	  		/* Flexible array member (C99 6.7.2.1p18): legal only as the
+	  		   last of at least two fields. p->link (this field's
+	  		   position in the ORIGINAL, declaration-order chain, unlike
+	  		   *q/q below which the compaction pass further down
+	  		   rewrites to drop anonymous bit-field padding entries) is
+	  		   NULL exactly when nothing was declared after it. */
+	  		if (p->link != NULL)
+	  			error("flexible array member `%s' must be the last member of `%t'\n",
+	  				p->name, ty);
+	  		else if (nfields < 2)
+	  			error("flexible array member `%s' cannot be the only member of `%t'\n",
+	  				p->name, ty);
+	  	}
 	  for (p = *q; p; p = p->link) {
 	  	int a = p->type->align ? p->type->align : 1;
 		if (p->lsb)
@@ -654,7 +765,77 @@ static void fields(Type ty) {
 	  	ty->size = inttype->u.sym->u.limits.max.i&(~(ty->align - 1));
 	  } }
 }
-static void funcdefn(int sclass, char *id, Type ty, Symbol params[], Coordinate pt) {
+/* Parses an inline function's body -- required to be exactly one
+   `return expr;` -- and, on success, captures it into f->u.f.is_inline/
+   inline_params/inline_body for enode.c's inline_expand() to clone at
+   every call site (see c.h's comment on those fields for the full
+   design, and inline_clone_subst()'s for why a separate, persistent set
+   of placeholder parameter symbols is needed rather than reusing
+   `callee` directly).
+
+   Consumes the opening `{` itself and, like compound() does for a
+   function's own top-level (level == LOCAL) block, leaves the closing
+   `}` for the caller (funcdefn()) to consume the same way it already
+   does for a normal function body -- one fewer thing for the inline
+   path to diverge on. */
+static void parse_inline_body(Symbol f, Symbol callee[]) {
+	Tree p;
+	Type rty = freturn(f->type);
+	Symbol *placeholders;
+	int i, n, save;
+
+	expect('{');
+	if (t != RETURN) {
+		error("inline function `%s' must have a body consisting of exactly one return statement\n", f->name);
+		while (t != '}' && t != EOI)
+			t = gettok();
+		return;
+	}
+	t = gettok();
+	if (isstruct(unqual(rty)))
+		error("inline function `%s' cannot return a struct or union\n", f->name);
+	save = where;
+	where = PERM; /* this tree must outlive f's own compilation -- see c.h */
+	p = pointer(expr(0));
+	{
+		Type cty = assign(rty, p);
+		if (cty == NULL)
+			error("illegal return type in inline function `%s'; found `%t' expected `%t'\n",
+				f->name, p->type, rty);
+		else
+			p = cast(p, cty);
+	}
+	if (t != ';')
+		error("inline function `%s' body must be a single return statement\n", f->name);
+	else
+		t = gettok();
+	if (t != '}') {
+		error("inline function `%s' body must be exactly one return statement\n", f->name);
+		while (t != '}' && t != EOI)
+			t = gettok();
+	}
+
+	for (n = 0; callee[n]; n++)
+		;
+	placeholders = (Symbol *)newarray(n + 1, sizeof *placeholders, PERM);
+	for (i = 0; i < n; i++) {
+		Symbol ph;
+		NEW0(ph, PERM);
+		ph->name = callee[i]->name;
+		ph->type = callee[i]->type;
+		ph->scope = PARAM;
+		ph->sclass = AUTO;
+		placeholders[i] = ph;
+	}
+	placeholders[n] = NULL;
+	p = inline_clone_subst(p, callee, placeholders, n);
+	where = save;
+
+	f->u.f.is_inline = 1;
+	f->u.f.inline_params = placeholders;
+	f->u.f.inline_body = p;
+}
+static void funcdefn(int sclass, char *id, Type ty, Symbol params[], Coordinate pt, int is_inline) {
 	int i, n;
 	Symbol *callee, *caller, p;
 	Type rty = freturn(ty);
@@ -766,6 +947,23 @@ static void funcdefn(int sclass, char *id, Type ty, Symbol params[], Coordinate 
 	codelist->next = NULL;
 	if (!IR->wants_callb && isstruct(rty))
 		retv = genident(AUTO, ptr(unqual(rty)), PARAM);
+	if (is_inline) {
+		/* No compound()/codegen at all: an inline function is never
+		   emitted as real callable code (see c.h's is_inline comment),
+		   only cloned into its callers by enode.c's inline_expand().
+		   Mirrors just the two things compound() would otherwise have
+		   done that still matter here: consuming through the closing
+		   '}' (parse_inline_body() does the rest of the body itself)
+		   and exitscope() to leave PARAM-level scope, matching the
+		   normal path's own exitscope()+expect('}') below exactly. */
+		parse_inline_body(cfunc, callee);
+		exitscope();
+		expect('}');
+		labels = stmtlabs = NULL;
+		retv = NULL;
+		cfunc = NULL;
+		return;
+	}
 	compound(0, NULL, 0);
 
 	definelab(cfunc->u.f.label);
@@ -824,7 +1022,7 @@ static void oldparam(Symbol p, void *cl) {
 void compound(int loop, struct swtch *swp, int lev) {
 	Code cp;
 	int nregs;
-	List saved_autos, saved_registers;
+	List saved_autos, saved_registers, saved_vla_pending;
 
 	walk(NULL, 0, 0);
 	cp = code(Blockbeg);
@@ -857,7 +1055,9 @@ void compound(int loop, struct swtch *swp, int lev) {
 	   caller. */
 	saved_autos = autos;
 	saved_registers = registers;
+	saved_vla_pending = vla_pending;
 	autos = registers = NULL;
+	vla_pending = NULL;
 	if (level == LOCAL && IR->wants_callb
 	&& isstruct(freturn(cfunc->type))) {
 		retv = genident(AUTO, ptr(unqual(freturn(cfunc->type))), level);
@@ -896,6 +1096,20 @@ void compound(int loop, struct swtch *swp, int lev) {
 		else
 			break;
 	}
+	if (vla_pending != NULL) {
+		/* Auto-free, straight-line-exit only -- see dcllocal()'s own
+		   comment on vla_pending for why an early return/break/goto
+		   out of this block isn't covered. Order among multiple VLAs
+		   in the same block doesn't matter (each is an independent
+		   malloc()/free() pair); whatever order ltov() happens to
+		   produce is fine. */
+		int i;
+		Symbol *v = ltov(&vla_pending, STMT);
+		Symbol freesym = lookup(string("free"), identifiers);
+		for (i = 0; v[i]; i++)
+			walk(root(vcall(freesym, voidtype, idtree(v[i]), NULL)), 0, 0);
+	}
+	vla_pending = saved_vla_pending;
 	{
 		int i;
 		Symbol *a = ltov(&autos, STMT);
@@ -1046,7 +1260,36 @@ static void checkref(Symbol p, void *cl) {
 }
 static Symbol dcllocal(int sclass, char *id, Type ty, Coordinate *pos) {
 	Symbol p, q;
+	Type vla_elemty = NULL; /* set below iff this declarator turned out to be a VLA */
 
+	if (is_vla) {
+		/* dclr1() already flagged this and left `ty` as ARRAY(elemty)
+		   with size 0 -- see its own comment for why the actual
+		   rewrite has to happen here instead, once there's a real
+		   Symbol to attach it to. Only the *type* changes here (to a
+		   plain pointer, so every existing bit of code downstream --
+		   the sclass switch below, the register/stack allocation
+		   backend, &c. -- just sees an ordinary pointer local and
+		   needs no VLA-specific handling of its own); the actual
+		   malloc() call is emitted further down, after sclass is
+		   resolved, the same place a real `= expr` initializer would
+		   be. */
+		vla_elemty = ty->type;
+		is_vla = 0;
+		if (sclass == STATIC || sclass == EXTERN || sclass == REGISTER) {
+			error("variable-length array `%s' cannot be `%k'\n", id, sclass);
+			vla_elemty = NULL; /* fall through as a plain (broken, but not doubly-broken) size-0 array */
+		} else {
+			Symbol mallocsym = lookup(string("malloc"), identifiers);
+			Symbol freesym = lookup(string("free"), identifiers);
+			if (mallocsym == NULL || !isfunc(mallocsym->type)
+			||  freesym   == NULL || !isfunc(freesym->type)) {
+				error("variable-length array `%s' needs malloc()/free() declared (#include \"heap.h\")\n", id);
+				vla_elemty = NULL;
+			} else
+				ty = ptr(vla_elemty);
+		}
+	}
 	if (sclass == 0)
 		sclass = isfunc(ty) ? EXTERN : AUTO;
 	else if (isfunc(ty) && sclass != EXTERN) {
@@ -1109,7 +1352,29 @@ static Symbol dcllocal(int sclass, char *id, Type ty, Coordinate *pos) {
 		       	p->addressed = 1; break;
 	default: assert(0);
 	}
-	if (t == '=') {
+	if (vla_elemty != NULL) {
+		/* `p = (elemty*) malloc(vla_size_tree * sizeof(elemty));` --
+		   built rather than parsed, since there's no `= malloc(...)`
+		   in the source for a VLA declarator to begin with. Freed
+		   automatically at the end of this variable's own block, but
+		   -- see compound()'s own comment on vla_pending -- only
+		   along the straight-line path out of that block: an early
+		   return/break/goto out of it skips the free(), which is a
+		   real, deliberate limitation (matching this codebase's other
+		   intentionally-scoped features, e.g. inline functions only
+		   covering a single-return-statement body) rather than an
+		   oversight -- doing this correctly for every possible exit
+		   path would need unwind-style bookkeeping this compiler has
+		   nowhere else. */
+		Tree bytes = (*optree['*'])(MUL,
+			cast(vla_size_tree, unsignedtype),
+			cnsttree(unsignedtype, (long)vla_elemty->size));
+		Symbol mallocsym = lookup(string("malloc"), identifiers);
+		Tree mcall = cast(vcall(mallocsym, NULL, bytes, NULL), p->type);
+		walk(root(asgn(p, mcall)), 0, 0);
+		p->ref = 1;
+		vla_pending = append(p, vla_pending);
+	} else if (t == '=') {
 		Tree e;
 		if (sclass == EXTERN)
 			error("illegal initialization of `extern %s'\n", id);

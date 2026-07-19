@@ -291,6 +291,31 @@ struct symbol {
 			int label;
 			int ncalls;
 			Symbol *callee;
+			/* `inline` support (see decl.c's parse_inline_body() and
+			   enode.c's inline_expand()): set only for a function
+			   defined with the `inline` specifier, whose body was
+			   exactly one `return expr;` statement. is_inline stays 0
+			   for every other function, including a prototype-only
+			   `inline` declaration that's never actually defined --
+			   call() (enode.c) only expands a call once this is set.
+			   inline_params is a NULL-terminated array, one placeholder
+			   Symbol per parameter (PERM-arena, distinct from the real,
+			   FUNC-arena parameter symbols in `callee` above, which
+			   don't outlive this function's own compilation --
+			   parse_inline_body() explains why a separate, persistent
+			   set is needed). inline_body is the function's return
+			   expression, PERM-arena, with every reference to a real
+			   parameter already rewritten to reference the matching
+			   inline_params[i] placeholder instead -- inline_expand()
+			   clones this tree at each call site, substituting
+			   inline_params[i] for that call's own argument-holding
+			   temporary. A function used this way is never actually
+			   emitted as callable code (no compound()/gencode() ever
+			   runs for it) -- taking its address or calling it
+			   indirectly isn't supported and will fail to link. */
+			unsigned is_inline:1;
+			Symbol *inline_params;
+			Tree inline_body;
 		} f;
 		int seg;
 		Symbol alias;
@@ -435,6 +460,16 @@ extern void compound(int, Swtch, int);
 extern Code beginforscope(List *save_autos, List *save_registers);
 extern void forinitdecl(void);
 extern void endforscope(Code cp, List save_autos, List save_registers);
+/* Deep-clones Tree t (NULL-safe), allocating every new node in the
+   current `where` arena, replacing each leaf that references from[i]
+   (for any i in 0..n-1) with a fresh reference to to[i] instead of
+   copying it verbatim. Shared by decl.c's parse_inline_body() (cloning
+   an inline function's just-parsed body into PERM storage, replacing
+   its real, FUNC-arena parameter symbols with persistent placeholders)
+   and enode.c's inline_expand() (cloning that stored body at each call
+   site, replacing the placeholders with that call's own argument
+   temporaries) -- see either for the fuller picture. */
+extern Tree inline_clone_subst(Tree t, Symbol *from, Symbol *to, int n);
 extern void defglobal(Symbol, int);
 extern void finalize(void);
 extern void program(void);

@@ -231,6 +231,12 @@ int gettok(void) {
 				tsym = inttype->u.sym;
 				return INT;
 			}
+			if (rcp[0] == 'n' && rcp[1] == 'l' && rcp[2] == 'i'
+			&&  rcp[3] == 'n' && rcp[4] == 'e'
+			&& !(map[rcp[5]]&(DIGIT|LETTER))) {
+				cp = rcp + 5;
+				return INLINE;
+			}
 			goto id;
 		case 'h': case 'j': case 'k': case 'm': case 'n': case 'o':
 		case 'p': case 'q': case 'x': case 'y': case 'z':

@@ -90,7 +90,7 @@ xx(WHILE,       84,     0,      0,      0,      IF,     "while")
 xx(TYPECODE,    85,     0,      0,      0,      ID,     "__typecode")
 xx(FIRSTARG,    86,     0,      0,      0,      ID,     "__firstarg")
 xx(ASM,         87,     0,      IASM,   0,      IF,     "asm") //wjr jan 31
-yy(0,           88,     0,      0,      0,      0,      0)
+xx(INLINE,      88,     0,      0,      0,      STATIC, "inline")
 yy(0,           89,     0,      0,      0,      0,      0)
 yy(0,           90,     0,      0,      0,      0,      0)
 yy(0,           91,     0,      0,      0,      '[',    "[")

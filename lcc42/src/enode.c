@@ -17,12 +17,123 @@ Tree (*optree[])(int, Tree, Tree) = {
 #define yy(a,b,c,d,e,f,g) e,
 #include "token.h"
 };
+
+/* See this function's own extern declaration in c.h for the full picture;
+   this is the generic "walk and rebuild, substituting a few leaves" half
+   of it. A leaf here means kids[0]==kids[1]==NULL, true for a symbol
+   *address* reference (op family ADDRG/ADDRF/ADDRL, u.sym valid) but
+   also for a plain constant (op family CNST, u.v valid, no u.sym at
+   all) -- only the former ever needs comparing against from[], so
+   generic(t->op) is checked before touching u.sym at all, rather than
+   risk reading a Value's bits as though they were a Symbol pointer.
+
+   A matched leaf is replaced with a shallow copy of *itself*, just with
+   u.sym repointed at to[i] -- not idtree(to[i]): idtree() always wraps
+   a fresh reference in its own INDIR (rvalue()), since normally the
+   only way to *get* a bare ADDR* leaf is to be idtree() being called
+   fresh. Here the leaf being replaced is an ADDR* node sitting exactly
+   where it did in the original tree -- typically already under the
+   original's own INDIR, added when the parameter was first referenced
+   during that original parse -- and that wrapper is preserved as-is by
+   the recursion below. Calling idtree() here would add a *second*
+   INDIR on top of the preserved one, turning "value of the temp" into
+   "whatever's stored at the address the temp's value happens to hold".
+   (Caught by an actual double-indirect load in the generated code for
+   `square(5)`, not by inspection -- worth remembering next time a new
+   substitution site is added here.)
+
+   Anything that isn't one of the substituted symbols (a global
+   referenced from inside the body, a constant, an operator node, ...)
+   still needs to end up as a fresh node in the *caller's* current arena
+   rather than the original -- hence copying and recursing into kids
+   even for the non-substituted case, instead of returning t itself
+   unchanged. */
+Tree inline_clone_subst(Tree t, Symbol *from, Symbol *to, int n) {
+	Tree clone;
+	int i;
+
+	if (t == NULL)
+		return NULL;
+	if (t->kids[0] == NULL && t->kids[1] == NULL) {
+		int fam = generic(t->op);
+		if (fam == ADDRG || fam == ADDRF || fam == ADDRL)
+			for (i = 0; i < n; i++)
+				if (t->u.sym == from[i]) {
+					NEW0(clone, where);
+					*clone = *t;
+					clone->node = NULL;
+					clone->u.sym = to[i];
+					return clone;
+				}
+	}
+	NEW0(clone, where);
+	*clone = *t;
+	clone->node = NULL; /* codegen's per-node cache; must not alias the original's */
+	clone->kids[0] = inline_clone_subst(t->kids[0], from, to, n);
+	clone->kids[1] = inline_clone_subst(t->kids[1], from, to, n);
+	return clone;
+}
+
+/* Expands a call to an inline function (see c.h's is_inline/inline_params/
+   inline_body for what's already been captured at its definition) into
+   `(tmp0 = arg0, tmp1 = arg1, ..., substituted-body)`: each argument is
+   parsed and cast against the real parameter's type exactly like a
+   normal call would, then assigned to a fresh temporary of that same
+   type -- evaluated left to right, each exactly once, which is the
+   whole point versus a textual #define (SQUARE(i++) only increments i
+   once here). inline_clone_subst() then produces this call site's own
+   copy of the stored body with every placeholder swapped for the
+   matching temp. */
+static Tree inline_expand(Symbol f, Coordinate src) {
+	int i, n, nseen = 0;
+	Symbol *params = f->u.f.inline_params;
+	Symbol *temps;
+	Tree *asgns;
+	Tree result;
+
+	(void)src;
+	for (n = 0; params[n]; n++)
+		;
+	temps = n ? (Symbol *)newarray(n, sizeof *temps, FUNC) : NULL;
+	asgns = n ? (Tree *)newarray(n, sizeof *asgns, FUNC) : NULL;
+	if (t != ')')
+		for (;;) {
+			Tree q = value(pointer(expr1(0)));
+			if (nseen < n) {
+				Type aty = assign(params[nseen]->type, q);
+				if (aty)
+					q = cast(q, aty);
+				else
+					error("type error in argument %d to inline function %s; found `%t' expected `%t'\n",
+						nseen + 1, f->name, q->type, params[nseen]->type);
+				temps[nseen] = temporary(AUTO, unqual(params[nseen]->type));
+				asgns[nseen] = asgn(temps[nseen], q);
+			} else {
+				error("too many arguments to inline function %s\n", f->name);
+			}
+			nseen++;
+			if (t != ',')
+				break;
+			t = gettok();
+		}
+	expect(')');
+	if (nseen < n)
+		error("insufficient number of arguments to inline function %s\n", f->name);
+	if (nseen > n)
+		nseen = n; /* the excess args were still parsed/error'd above; just don't chain them */
+	result = inline_clone_subst(f->u.f.inline_body, params, temps ? temps : params, n);
+	for (i = nseen - 1; i >= 0; i--)
+		result = tree(RIGHT, result->type, asgns[i], result);
+	return result;
+}
 Tree call(Tree f, Type fty, Coordinate src) {
 	int n = 0;
 	Tree args = NULL, r = NULL, e;
 	Type *proto, rty = unqual(freturn(fty));
 	Symbol t3 = NULL;
 
+	if (generic(f->op) == ADDRG && f->u.sym && f->u.sym->u.f.is_inline)
+		return inline_expand(f->u.sym, src);
 	if (fty->u.f.oldstyle)
 		proto = NULL;
 	else

@@ -306,18 +306,32 @@ jcU4:	macro	reg1,reg2,brop,label	;21 bytes, lbr@18
 	inc	sp
 	brop	label
 	endm
+;19-07-26 wjr: every jc*I/jn*I/je*I macro below splits its immediate into
+;hi/lo bytes via ((ival)&0xFFFF)#256 and ((ival)&0xFFFF)>>8. The compiler emits ival as a
+;plain signed decimal for an int constant (sym.c's vtoa(), INT case:
+;stringd(v.i)) -- exactly right for a normal store, but asl's own #/>>
+;operators choke on a negative ival here ("range underflow"), e.g.
+;`x == -1000` for a plain `int x`. `(ival)&0xFFFF` first coerces it to
+;the same value's unsigned 16-bit two's-complement form (bit-identical,
+;so the hi/lo split it feeds into #256/>>8 is unaffected either way for
+;an already-non-negative ival) before splitting, sidestepping asl's
+;negative-operand limitation without touching how the compiler formats
+;the constant. Root-caused via a minimal standalone `asl` repro (a
+;`jneU2I R11,-1000,label` one-liner) isolating this from the compiler
+;entirely, then confirmed against the real pipeline with both negative
+;and the existing positive/unsigned cases (see toolchain-side notes).
 jcI1I:	macro	reg1,ival,brop,label	;signed comparison - one byte immediate -for nopromo
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	brop	label  ;execute
 	endm
 jcI2I:	macro	reg1,ival,brop,label	;signed comparison - register immediate -17 bytes, ls@10, lbr@14
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	ghi	reg1
-	smbi    (ival)>>8; was/256	;that's a standard signed subtraction
+	smbi    ((ival)&0xFFFF)>>8; was/256	;that's a standard signed subtraction
 	ghi	reg1 ;
-	xri	(ival)>>8; was/256	;sets the top bit if the signs are different
+	xri	((ival)&0xFFFF)>>8; was/256	;sets the top bit if the signs are different
 	shlc          ;the original df is now in bit 0 and df=1 if signs were different
 	lsnf	;bypass the df flip if signs were the same
 	xri	01     ;invert original df if signs were different
@@ -326,11 +340,11 @@ jcI2I:	macro	reg1,ival,brop,label	;signed comparison - register immediate -17 by
 	endm
 jnI2I:	macro	reg1,ival,brop,label	;reverse signed comparison - register immediate -17 bytes, ls@10, lbr@14
 	glo	reg1
-	sdi	(ival)#256	;subtract d FROM immediate value
+	sdi	((ival)&0xFFFF)#256	;subtract d FROM immediate value
 	ghi	reg1
-	sdbi    (ival)>>8; was/256	;that's a standard signed subtraction (of register FROM immediate)
+	sdbi    ((ival)&0xFFFF)>>8; was/256	;that's a standard signed subtraction (of register FROM immediate)
 	ghi	reg1 ;
-	xri	(ival)>>8; was/256	;sets the top bit if the signs are different
+	xri	((ival)&0xFFFF)>>8; was/256	;sets the top bit if the signs are different
 	shlc          ;the original df is now in bit 0 and df=1 if signs were different
 	lsnf	;bypass the df flip if signs were the same
 	xri	01     ;invert original df if signs were different
@@ -339,16 +353,16 @@ jnI2I:	macro	reg1,ival,brop,label	;reverse signed comparison - register immediat
 	endm
 jcU2I:	macro	reg1,ival,brop,label ;-9 bytes, lbr@6
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	ghi	reg1
-	smbi	(ival)>>8; was/256
+	smbi	((ival)&0xFFFF)>>8; was/256
 	brop	label
 	endm
 jnU2I:	macro	reg1,ival,brop,label	;reverse unsigned comparison - 9 byes, lbr@6
 	glo	reg1
-	sdi	(ival)#256	;subtract d FROM immediate value
+	sdi	((ival)&0xFFFF)#256	;subtract d FROM immediate value
 	ghi	reg1
-	sdbi	(ival)>>8; was/256 ; sfinish subtracting register FROM immediate value
+	sdbi	((ival)&0xFFFF)>>8; was/256 ; sfinish subtracting register FROM immediate value
 	brop	label
 	endm
 jneU2:	macro	reg1,reg2,label	;-18 bytes, lbr@6, lbr@15
@@ -379,18 +393,18 @@ jneU1:	macro	reg1,reg2,label	;-18 bytes, lbr@6, lbr@15
 
 jneU2I:	macro	reg1,ival,label	;-12 bytes, lbr@3, lbr@9
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	lbnz	label
 	ghi	reg1
-	smbi	(ival)>>8; was/256
+	smbi	((ival)&0xFFFF)>>8; was/256
 	lbnz	label
 	endm
 jneU2NI: macro	reg1,ival,label	;jump if storage at reg1%!=lval
 	lda	reg1
-	smi	(ival)>>8; was/256
+	smi	((ival)&0xFFFF)>>8; was/256
 	lbnz	label
 	ldn	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	lbnz	label
 	endm
 
@@ -473,15 +487,15 @@ jeqI1:	macro	reg1,reg2,label	;18 bytes, lbr@6, lbr@15
 	endm
 jeqU1I:	macro	reg1,ival,label	;12 bytes, lbr@3-12, lbr@9
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	lbz	label
 	endm
 jeqU2I:	macro	reg1,ival,label	;12 bytes, lbr@3-12, lbr@9
 	glo	reg1
-	smi	(ival)#256
+	smi	((ival)&0xFFFF)#256
 	lbnz	+
 	ghi	reg1
-	smbi	(ival)>>8; was/256
+	smbi	((ival)&0xFFFF)>>8; was/256
 	lbz	label
 +:
 	endm
