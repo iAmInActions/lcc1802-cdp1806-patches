@@ -266,6 +266,34 @@ struct symbol {
 	unsigned defined:1;
 	Type type;
 	float ref;
+
+	/* `__bank(N)` support (decl.c's specifier(), enode.c's call()/
+	   idtree() rewriting -- see sbc1806/bankcompile.h): which 32KB ROM
+	   bank (0-3) this function or static/global object's own storage
+	   is compiled into. 0 (the default, for any symbol never tagged
+	   with __bank) means "wherever the compiler's normal, unwrapped
+	   flow currently is" -- no special placement, no bank-crossing
+	   codegen ever applies to a bank-0 symbol, matching how programs
+	   that don't use this feature at all behave completely unchanged.
+	   Meaningless (left 0, ignored) for anything without its own real,
+	   fixed-address storage: AUTO locals, parameters, typedefs,
+	   struct/union tags, enum constants, and members. */
+	int bank;
+
+	/* `__romlink` support (decl.c's specifier()/dclglobal(), enode.c's
+	   bank_wrap_call() -- see sbc1806/romlink.h): marks a function
+	   declaration (never a definition -- a __romlink function has no
+	   local body, ever) as resolved against an *externally* built ROM
+	   image's own symbol table instead of anything in this translation
+	   unit. romaddr/bank are filled in from the -Wf,-romsyms,<path>
+	   table (main.c) at the point the declaration is parsed; `bank`
+	   above is reused for the romlink case too (same meaning -- which
+	   ROM bank the real code lives in -- just sourced from the loaded
+	   table instead of __bank(N) syntax). Calling a __romlink function
+	   never references its own (nonexistent) local label; see
+	   bank_wrap_call()'s own comment for why that's safe. */
+	unsigned romlink:1;
+	unsigned long romaddr;
 	union {
 		struct {
 			int label;
@@ -471,6 +499,7 @@ extern void endforscope(Code cp, List save_autos, List save_registers);
    temporaries) -- see either for the fuller picture. */
 extern Tree inline_clone_subst(Tree t, Symbol *from, Symbol *to, int n);
 extern void defglobal(Symbol, int);
+extern void romsyms_load(const char *path); /* decl.c; called from the backend's own progbeg() (xr18CX.md) to parse -Wf,-romsyms=<path> before any C source is parsed -- see decl.c's own __romlink header comment */
 extern void finalize(void);
 extern void program(void);
 

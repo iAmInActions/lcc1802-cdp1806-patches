@@ -696,6 +696,27 @@ int gettok(void) {
 				cp = rcp + 9;
 				return FIRSTARG;
 			}
+			if (rcp[0] == '_'
+			&&  rcp[1] == 'b'
+			&&  rcp[2] == 'a'
+			&&  rcp[3] == 'n'
+			&&  rcp[4] == 'k'
+			&& !(map[rcp[5]]&(DIGIT|LETTER))) {
+				cp = rcp + 5;
+				return BANK;
+			}
+			if (rcp[0] == '_'
+			&&  rcp[1] == 'r'
+			&&  rcp[2] == 'o'
+			&&  rcp[3] == 'm'
+			&&  rcp[4] == 'l'
+			&&  rcp[5] == 'i'
+			&&  rcp[6] == 'n'
+			&&  rcp[7] == 'k'
+			&& !(map[rcp[8]]&(DIGIT|LETTER))) {
+				cp = rcp + 8;
+				return ROMLINK;
+			}
 			goto id;
 		default:
 			if ((map[cp[-1]]&BLANK) == 0)

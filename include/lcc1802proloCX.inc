@@ -510,16 +510,16 @@ ldAD:	macro	reg1,directaddress	;load an absolute address or a constant into a re
  else
 	ldi	(directaddress)&255
 	plo	reg1
-	ldi	(directaddress)>>8; was/256
+	ldi	((directaddress)&0xFFFF)>>8; was/256
 	phi	reg1
  endif
 	endm
 ldAX:	macro	reg1,basereg,offset	;load a base+offset address into a register
 	glo	basereg
-	adi	(offset)#256
+	adi	((offset)&0xFFFF)#256
 	plo	reg1
 	ghi	basereg
-	adci	(offset)>>8; was/256
+	adci	((offset)&0xFFFF)>>8; was/256
 	phi	reg1
 	endm
 ldAXs:	macro	reg1,basereg,offset	;load a stack-pointer+offset address into a register
@@ -698,10 +698,10 @@ negI2:	macro	tgt,src			;two byte negation from src to tgt
 	endm
 alu2I: macro	tgt,src,imm,op1,op2	;2 byte register/immediate alu operation
 	glo 	src
-	op1	(imm)#256
+	op1	((imm)&0xFFFF)#256
 	plo	tgt
 	ghi	src
-	op2	(imm)>>8; was/256
+	op2	((imm)&0xFFFF)>>8; was/256
 	phi	tgt
 	endm
 alu1: macro	tgt,src1,src2,op1,op2	;1 byte register/register alu operation with 9 bit result
@@ -766,7 +766,7 @@ st2I:	macro	immedval,OorD,destBase,destOff ;2 byte store of a literal to direct 
 	else
 		ldAD	memAddr,destBase
 	endif
-	ldi	(immedval)>>8; top byte
+	ldi	((immedval)&0xFFFF)>>8; top byte
 	str	memAddr
 	inc	memAddr
 	ldi	(immedval) & 255;low byte
@@ -846,7 +846,7 @@ str2:	macro	reg,addrReg ;2 byte store to address pointed to by a register
 	dec	addrReg
 	endm
 str2I:	macro	immedval,addrReg ;2 byte immediate store to address pointed to by a register
-	ldi	(immedval)>>8; top byte
+	ldi	((immedval)&0xFFFF)>>8; top byte
 	str	addrReg
 	inc	addrReg
 	ldi	(immedval) & 255;low byte
@@ -967,7 +967,7 @@ ldiReg:	macro	reg,value
  else
 	ldi	(value)&255
 	plo	reg
-	ldi	(value)>>8; was/256
+	ldi	((value)&0xFFFF)>>8; was/256
 	phi	reg
  endif
 	endm

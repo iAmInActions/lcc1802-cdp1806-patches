@@ -754,6 +754,11 @@ static void progbeg(int argc, char *argv[]) {
                         argbufloc = atoi(strstr(argv[i], "-argbufloc=")+11);
                 	fprintf(stderr,"argument buffer relocated to 0x%x\n",argbufloc);
                 }
+                if (strstr(argv[i], "-romsyms=") != 0){ //accept combined args -- __romlink support, see decl.c
+                        char *path = strstr(argv[i], "-romsyms=")+9;
+                	fprintf(stderr,"loading ROM symbol table from %s\n",path);
+                        romsyms_load(path);
+                }
 	}
 	fprintf(stderr,"September, I'll remember the fourth wave\n");  //just so I know who's playing
         time(&now);

@@ -418,9 +418,30 @@ Tree idtree(Symbol p) {
 	Tree e;
 	Type ty = p->type ? unqual(p->type) : voidptype;
 
-	if (p->scope == GLOBAL || p->sclass == STATIC)
+	if (p->scope == GLOBAL || p->sclass == STATIC) {
 		op = ADDRG;
-	else if (p->scope == PARAM) {
+		/* __bank(1) data (romlink-test/README.md's "fully automatic
+		   copy-on-access" idea, attempted and abandoned -- see
+		   enode.c's bank_wrap_call() for the closely related call-side
+		   story and why: the same kind of tree-level rewrite needed
+		   here hits the same class of not-fully-understood code
+		   generator fragility, so this is the same fallback rather
+		   than a second attempt at the same risk). ty here is p's
+		   *unqualified* type; isfunc(ty) is true for a bare function
+		   reference (e.g. taking its address, or the callee position
+		   before call() ever runs) -- those are a completely separate
+		   case with their own bank check (enode.c), not this one,
+		   which is specifically about *data*. */
+		if (!isfunc(ty) && p->bank != (cfunc ? cfunc->bank : 0))
+			error("`%s' is in bank %d, referenced from bank %d: direct "
+				"cross-bank data access isn't supported -- write a "
+				"same-bank helper (tagged __bank(%d) too) that copies "
+				"it into a caller-supplied buffer, and call that "
+				"helper instead (see enode.c's bank_wrap_call() for "
+				"why calling it also needs a hand-written asm() "
+				"trampoline right now)\n",
+				p->name, p->bank, cfunc ? cfunc->bank : 0, p->bank);
+	} else if (p->scope == PARAM) {
 		op = ADDRF;
 		if (isstruct(p->type) && !IR->wants_argb)
 			{

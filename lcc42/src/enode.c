@@ -4,6 +4,7 @@ static char rcsid[] = "$Id: enode.c,v 1.1 2002/08/28 23:12:42 drh Exp $";
 
 static Tree addtree(int, Tree, Tree);
 static Tree andtree(int, Tree, Tree);
+static Tree bank_wrap_call(Tree, Type, Type, Tree, Symbol);
 static Tree cmptree(int, Tree, Tree);
 static int compatible(Type, Type);
 static int isnullptr(Tree e);
@@ -176,6 +177,17 @@ Tree call(Tree f, Type fty, Coordinate src) {
 					else
 						q = cast(q, promote(q->type));
 				}
+			/* setRAMbank(7) is never valid: RAM bank 7 is the volatile
+			   chip's own top bank, physically the same bytes as the
+			   fixed 0xC000-0xFFFF window (stack/ARGBUF/heap/the bank
+			   mirror itself) -- see sbc1806/bankswitch.h's own doc
+			   comment. Only catches a literal constant 7 argument, not
+			   a variable that happens to evaluate to 7 at runtime;
+			   setRAMbank() itself (bankswitch.c) has the real,
+			   unconditional runtime guard for that. */
+			if (n == 0 && f->u.sym && f->u.sym->name == string("setRAMbank")
+			&& (q->op == CNST+I || q->op == CNST+U) && q->u.v.i == 7)
+				warning("WARN: Invalid RAM bank selected\n");
 			if (!IR->wants_argb && isstruct(q->type))
 				if (iscallb(q))
 					q = addrof(q);
@@ -204,10 +216,117 @@ Tree call(Tree f, Type fty, Coordinate src) {
 			funcname(f));
 	if (r)
 		args = tree(RIGHT, voidtype, r, args);
-	e = calltree(f, rty, args, t3);
+	e = bank_wrap_call(f, fty, rty, args, t3);
 	if (events.calls)
 		apply(events.calls, &src, &e);
 	return e;
+}
+
+/* __bank(1) support, other half of decl.c's bank_enter()/bank_exit()
+   (see decl.c's own header comment on those for the placement side).
+   A direct call (f is a plain ADDRG leaf, not a function pointer -- an
+   indirect call has no compile-time-known bank to switch to at all, so
+   isn't checked here at all) to a function whose own bank differs from
+   cfunc's (the function currently being compiled) is rewritten to go
+   through sbc1806/bankcall.inc's fixed-RAM helper instead of calling
+   callee directly.
+
+   Two earlier, more "obvious" automatic rewrites were tried first and
+   both hit real, narrow code generator bugs specific to this compiler
+   (kept here since the next person tempted to simplify this back down
+   to one of them should know why not):
+
+   1. Calling setROMbank()/currentROMbank() (sbc1806/bankswitch.h) as
+      ordinary C functions, chained with the real call via the RIGHT
+      tree op the same way inline_expand() above chains its argument
+      assignments. Failed with "compiler error in _label--Bad terminal"
+      from the code generator. Reproduced with plain hand-written C (no
+      tree-building at all): sequencing *any* two real function calls in
+      one expression where one of them targets a __bank(1) function
+      fails the same way, confirmed by bisection across many
+      combinations, no reliable predictive rule found.
+
+   2. Emitting the bank switch as raw inline asm (matching how a C
+      asm("...") statement itself compiles -- see dag.c's IASM case)
+      instead of a real call, specifically to avoid sequencing two
+      CALL-tree nodes at all. Got further -- codegen accepted it -- but
+      crashed the compiler itself one pass later: "rcc: dag.c:576:
+      undag: Assertion `p->count == 0' failed".
+
+   Both failures share a root cause this rewrite sidesteps entirely:
+   *two real CALL nodes in one expression* is what's fragile here, not
+   cross-bank calls per se. bankcall.inc's helper collapses the
+   switch+call+restore sequence into a single indirect call (through a
+   compile-time-constant address, exactly like any ordinary C function
+   pointer call -- confirmed working via a plain
+   `((int(*)(void))0xEF16)()` test compile before wiring this in) to a
+   small fixed-RAM trampoline that itself does the bank switch, the
+   *actual* call to callee, and the restore, entirely in asm the
+   compiler never has to reason about as a second CALL tree node. The
+   only new nodes this function adds to the expression are two plain
+   ASGN trees (writing the target bank and target address to
+   bankcall.inc's own fixed argument cells) ahead of that one indirect
+   call -- the same "chain plain ASGN trees via RIGHT before the real
+   payload" shape inline_expand() already uses above for argument
+   binding, so nothing novel is asked of the tree-to-DAG machinery here.
+
+   Arguments and the return value are untouched by any of this: they
+   still flow through ARGBUF exactly as calltree(helper_f, rty, args,
+   t3) marshals them for *any* call, direct or indirect -- the helper
+   only ever touches its own fixed cells (BANKCALL_TARGET_BANK/ADDR/
+   SAVED_MIRROR/SCRATCH) and BANK_MIRROR, never ARGBUF, so it's
+   invisible to the caller/callee's own argument passing.
+
+   The three fixed addresses below (0xEF10/0xEF11/0xEF14) are
+   sbc1806/bankcall.h's own BANKCALL_TARGET_BANK/BANKCALL_TARGET_ADDR/
+   BANKCALL_HELPER_ADDR -- hardcoded here the same way enode.c's
+   setRAMbank(7) check hardcodes knowledge of that project's own
+   bankswitch.h, since __bank() is already an sbc1806-specific feature
+   through and through. Must stay in sync with bankcall.h's own layout
+   comment if that ever changes. A program using __bank() must call
+   bankcall_init() (bankcall.c) once at startup, before the first
+   cross-bank call, to copy bankcall.inc's template into place -- there
+   is no compile-time check for this; calling into an un-initialized
+   helper address silently runs whatever garbage/zero bytes are there. */
+static Tree bank_wrap_call(Tree f, Type fty, Type rty, Tree args, Symbol t3) {
+	Symbol callee;
+	Tree bank_asgn, addr_asgn, helper_f, real_call;
+	Tree addr_value;
+
+	if (generic(f->op) != ADDRG || f->u.sym == NULL)
+		return calltree(f, rty, args, t3);
+	callee = f->u.sym;
+	/* __romlink always redirects, regardless of cfunc's own bank -- a
+	   romlink symbol has no local definition at all (decl.c's
+	   dclglobal() guarantees this), so there's no "same bank, ordinary
+	   call" case to fall through to the way there is for a same-file
+	   __bank() callee. Checked before the bank-equality test below on
+	   purpose: callee->bank here is whatever romsyms_lookup() found in
+	   the loaded table, which happens to equal cfunc->bank whenever the
+	   ROM image's own build put that function in the RAM program's
+	   "home" bank number by coincidence -- still needs the redirect
+	   (the function isn't *actually* compiled into this translation
+	   unit, coincidental bank-number match or not), so is_romlink is
+	   checked first and short-circuits the bank-equality path entirely. */
+	if (callee->romlink) {
+		addr_value = cnsttree(unsignedtype, callee->romaddr);
+	} else {
+		if (callee->bank == (cfunc ? cfunc->bank : 0))
+			return calltree(f, rty, args, t3);
+		addr_value = cast(f, unsignedtype);
+	}
+
+	bank_asgn = asgntree(ASGN,
+		rvalue(cast(cnsttree(unsignedtype, 0xEF10UL), ptr(unsignedchar))),
+		cnsttree(unsignedchar, (unsigned long)callee->bank));
+	addr_asgn = asgntree(ASGN,
+		rvalue(cast(cnsttree(unsignedtype, 0xEF11UL), ptr(unsignedtype))),
+		addr_value);
+	helper_f = cast(cnsttree(unsignedtype, 0xEF14UL), ptr(fty));
+	real_call = calltree(helper_f, rty, args, t3);
+
+	return tree(RIGHT, real_call->type, bank_asgn,
+		tree(RIGHT, real_call->type, addr_asgn, real_call));
 }
 Tree calltree(Tree f, Type ty, Tree args, Symbol t3) {
 	Tree p;
